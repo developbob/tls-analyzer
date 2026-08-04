@@ -62,13 +62,86 @@ A score that does not match intuition is a broken score, not a finding.
 - [ ] `publicKeyBits` is non-zero and matches
       `openssl x509 -noout -text | grep "Public-Key"` for both an EC and an RSA
       certificate. EC certificates previously reported 0.
-- [ ] `TLS_AES_128_GCM_SHA256` reports `bits: 128`, not 256.
+- [ ] `TLS_AES_128_GCM_SHA256` reports `bits: 128`, not 256, and is marked
+      `negotiated: true`. It is the suite this scanner's client preference
+      selects, not the server's: openssl offering AES-256 first negotiates
+      `TLS_AES_256_GCM_SHA384` with the same host. A scan warning has to say so.
+
+### 5a. The two checks a disabled handshake verification would skip
+
+The scanner handshakes with verification off on purpose. Both checks it would
+otherwise skip have to run, and each must be reported whatever its outcome.
+
+- [ ] `tlsanalyzer wrong.host.badssl.com` reports the name check as failed, the
+      certificate dimension as `0/25`, and a `CERT_NAME_MISMATCH` HIGH finding.
+      Ground truth: `echo | openssl s_client -connect wrong.host.badssl.com:443
+      -servername wrong.host.badssl.com -verify_hostname wrong.host.badssl.com`
+      reports `verify error:num=62:hostname mismatch`. Note the flag:
+      `s_client` does not verify the hostname without it and reports
+      `Verification: OK`, which looks exactly like the tool being right.
+- [ ] Positive control on the same certificate:
+      `-verify_hostname badssl.com` reports `Verification: OK`.
+- [ ] `tlsanalyzer untrusted-root.badssl.com` reports the chain as not trusted,
+      the certificate dimension as `0/25`, and a `CERT_CHAIN_UNTRUSTED` HIGH
+      finding. openssl reports `verify error:num=19`.
+- [ ] `tlsanalyzer example.com --sni cloudflare.com` reports the certificate as
+      valid for `cloudflare.com`, and a scan warning names both that name and
+      the target, because "Target: example.com" and "valid for cloudflare.com"
+      are not the same claim.
+- [ ] Acceptance control: a well-configured public host (example.com,
+      cloudflare.com, github.com) reports both checks passing and the same
+      certificate score as the previous release. A guard that refuses real input
+      is a false clean of the opposite kind.
 
 ## 6. Determinism
 
 - [ ] Run the same scan five times. The `protocols` array order and the
       `preferred` marker are identical every run. Concurrency previously made
       both vary between runs.
+- [ ] Batch output follows the targets file, not completion order. With a file of
+      at least four hosts of visibly different latency, run
+      `tlsanalyzer --targets hosts.txt --format json | jq -r '.[].target'` three
+      times at the default concurrency and once at `--concurrency 1`. All four
+      runs list the hosts in file order. Before 0.4.0 the order varied between
+      identical runs, including at `--concurrency 1`.
+
+## 6a. The numbers reconcile
+
+Every number a reader can add up has to add up, and a number that was not
+measured must not read as a measurement.
+
+- [ ] The score breakdown closes: the dimension lines total the printed
+      `Dimension subtotal`, and `subtotal - Vulnerability penalty` equals the
+      printed `TLS Security score` and the headline. Use a host with findings, for
+      example `tlsanalyzer example.com`, where 66 - 45 = 21.
+- [ ] The penalty line itemises the severities behind it, and the counts match the
+      VULNERABILITIES section.
+- [ ] `--skip-vulns` prints `upper bound, vulnerability checks skipped` beside the
+      grade and `not measured` on the penalty line. Declining a check must never
+      read as a better result: it previously moved example.com from F (21/100) to
+      C (66/100) with no qualifier.
+- [ ] `--skip-quantum` normalises the subtotal over the three dimensions that ran
+      and says one dimension was not assessed.
+- [ ] `--policy cnsa-2.0-2027` on a host with hybrid key exchange and weaker
+      suites still on offer: the policy verdict and the CNSA 2.0 timeline
+      milestone for the same year may differ, and BOTH print a `Scope:` note that
+      says what they cover and names the other. Two opposite verdicts for one
+      deadline with no scope stated is the defect this closes.
+- [ ] The report keys its own markers: the milestone list carries a glyph legend
+      and the grade block explains Q+, Q, Q- and QV.
+
+## 6b. Published artifact
+
+Verify the artifact users download, not a local build. CI injects the version, so
+a local build cannot prove the release does.
+
+- [ ] The release carries `checksums.txt` plus all five archives.
+- [ ] Download one archive and the checksums file into an empty directory, then
+      `shasum -a 256 -c --ignore-missing checksums.txt` reports OK.
+      `--ignore-missing` is required, since the file lists all five.
+- [ ] The extracted binary's `version` reports the tag being released, and the
+      commit matches the tagged commit.
+- [ ] Re-run one behaviour that changed in this release on the downloaded binary.
 
 ## 7. Output formats
 
@@ -86,8 +159,86 @@ A score that does not match intuition is a broken score, not a finding.
       in help text or the README is actually registered.
 - [ ] `tlsanalyzer policies` lists policies, and each name is accepted by
       `--policy`.
+- [ ] `tlsanalyzer print-policy <name>` for every listed policy produces YAML
+      that `--policy-file` then accepts. A starting point the parser rejects is
+      worse than none.
+- [ ] Every YAML key in `docs/policies.md` is a key the loader accepts, and every
+      key in the schema appears in that document. Both directions are enforced by
+      tests; check one by hand, because the document is the only description of
+      the schema now that unknown keys are refused.
+- [ ] A policy file that cannot be understood is refused rather than reported
+      compliant: an empty file, a file with no `name`, a file with no rules, a
+      file with a misspelled key, and an `extends` naming a policy that does not
+      exist. Each names the problem and a next step. Before 0.4.0 an empty file
+      reported `COMPLIANT 100/100` and exit 0.
+- [ ] `--policy` and `--policy-file` together is an error, not a silent win for
+      one of them.
+
+### 8b. Rule VALUES, not just rule keys
+
+Refusing unknown keys says nothing about the values under them. Both gate runs
+that found a fail-open policy defect found it one level deeper than the last fix
+reached, so check the level below whatever was last tightened.
+
+- [ ] A misspelled protocol version is refused when the policy loads, not
+      silently dropped. Try `bannedVersions: ["TLSv1.2"]`, `["tls 1.2"]`,
+      `["TLS1.2"]`, a trailing space, and `minVersion: garbage`, against a host
+      that does enable TLS 1.2. Each must exit 1 naming the value and listing the
+      accepted spellings. Before this check existed every one of them reported
+      `COMPLIANT 100/100` and exit 0.
+- [ ] Acceptance control: `bannedVersions: ["TLS 1.2"]` against the same host is
+      a violation and exits 2, and `["SSL 2.0"]` still loads.
+- [ ] Banning `SSL 3.0`, which is what the built-in `modern` policy does, prints
+      a warning that the rule could not be tested and names another way to check
+      it. Go cannot offer SSL 2.0 or SSL 3.0, so silence there is not compliance.
+- [ ] Algorithm names match case-insensitively: `bannedAlgorithms: [sha1]` and
+      `[SHA1]` produce the same verdict on the same host.
+- [ ] **Every rule field in the schema changes a verdict in at least one
+      direction.** Read the field list from the struct tags in
+      `pkg/types/policy.go`, and for each one construct a policy that the target
+      does not satisfy. A field with no evaluator produces no violation, no
+      warning and no "not evaluated" entry, which reads as a pass: six of them
+      shipped that way, including two named by the built-in CNSA 2.0 policies
+      where `cipher.requiredKeyExchange` masked the gap by covering the same
+      ground. `grep -rn '\.FieldName' internal/ --include='*.go'` with no hit
+      outside the type definition is the cheap version of this check.
+- [ ] `certificate.requireCt` is reported as not evaluated, since the scanner
+      collects no SCTs, and the verdict is marked incomplete and exits 2.
+
+### 8a. Exit codes
+
+- [ ] `tlsanalyzer example.com --policy strict; echo $?` prints 2. A compliance
+      check that cannot fail a build is not a gate, and this exited 0 before
+      0.4.0.
+- [ ] A host that satisfies the policy exits 0, so the gate is not simply always
+      failing.
+- [ ] `--skip-quantum` against a policy with a `minQuantumScore` exits 2 and the
+      report lists the rule under "Not evaluated" with its reason. A verdict that
+      skipped rules has not established compliance, and the policy score only
+      rises when a rule is not evaluated.
+- [ ] An unreachable host exits 1, not 2, with or without `--policy`. A target
+      that was never reached carries no verdict.
+- [ ] A `--targets` sweep containing an unreachable host exits non-zero in
+      **both** `--format text` and `--format json`. Before 0.4.0 the JSON path
+      exited 0, so the fix had landed on one of the two output paths.
 - [ ] Bad input fails cleanly: unreachable host, invalid port, unknown policy,
       unknown format. No panics and no stack traces.
+- [ ] An error prints the message alone, not the usage block after it. Check
+      `--format bogus`, an unreachable host, and `-p 0`: each is one line on
+      stderr. A mistyped flag adds a pointer to `--help`.
+- [ ] Port range is enforced on both routes. `-p 0`, `-p -5` and `-p 70000` are
+      refused naming the flag; `host:70000` and `host:abc` are refused naming the
+      value; `-p 1`, `-p 65535` and `host:8443` are accepted. An out-of-range port
+      previously reached the dialer and was reported as an unreachable host.
+
+## 9. Test integrity
+
+- [ ] `git ls-files --others -- '*_test.go'` prints nothing. A test file git does
+      not track is a test CI never runs, while the local suite still passes
+      because Go does not consult git. An unanchored `tlsanalyzer` pattern in
+      `.gitignore` hid the whole `cmd/tlsanalyzer` test file for a full release.
+      CI enforces this too; check it here so a local run cannot look greener than
+      the pipeline.
 
 ## Result
 

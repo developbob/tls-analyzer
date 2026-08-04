@@ -5,10 +5,13 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -17,13 +20,15 @@ import (
 
 	"github.com/csnp/qramm-tls-analyzer/internal/analyzer"
 	"github.com/csnp/qramm-tls-analyzer/internal/reporter"
+	"github.com/csnp/qramm-tls-analyzer/internal/sanitize"
 	"github.com/csnp/qramm-tls-analyzer/internal/scanner"
 	"github.com/csnp/qramm-tls-analyzer/pkg/types"
 	"github.com/spf13/cobra"
+	"gopkg.in/yaml.v3"
 )
 
 var (
-	version = "0.3.0"
+	version = "0.4.0"
 	commit  = "dev"
 	date    = "unknown"
 )
@@ -46,10 +51,71 @@ var (
 	concurrency  int
 )
 
+// Exit codes. A compliance check that cannot fail a build is not a gate, and
+// policy non-compliance exited 0, so --policy could report 35 HIGH violations
+// and still let a pipeline through. The codes are separate so a job can tell a
+// failed policy from a scan that could not run at all, and they are documented
+// in --help and the README rather than only here.
+const (
+	exitScanFailed   = 1
+	exitPolicyFailed = 2
+)
+
+// policyGateError reports that a policy was applied and the target either did
+// not satisfy it or could not be fully evaluated against it. Both are failures
+// of the gate: a verdict that skipped rules has not established compliance, and
+// the policy score only rises when a rule is not evaluated.
+type policyGateError struct{ message string }
+
+func (e *policyGateError) Error() string { return e.message }
+
 func main() {
 	if err := rootCmd.Execute(); err != nil {
-		os.Exit(1)
+		var gate *policyGateError
+		if errors.As(err, &gate) {
+			os.Exit(exitPolicyFailed)
+		}
+		os.Exit(exitScanFailed)
 	}
+}
+
+// policyOutcome turns policy results into the process outcome.
+//
+// Scan failures are the caller's to report first: a target that was never
+// reached has no policy verdict, and reporting it as non-compliant would be a
+// verdict about nothing.
+func policyOutcome(results []*types.ScanResult) error {
+	var failed, incomplete []string
+
+	for _, result := range results {
+		if result == nil || result.PolicyResult == nil {
+			continue
+		}
+		if !result.PolicyResult.Compliant {
+			failed = append(failed, result.Target)
+		} else if !result.PolicyResult.Complete {
+			// A compliant verdict that skipped rules has not established
+			// compliance with the policy, only with the part of it that ran.
+			incomplete = append(incomplete, result.Target)
+		}
+	}
+
+	switch {
+	case len(failed) > 0 && len(incomplete) > 0:
+		return &policyGateError{fmt.Sprintf(
+			"policy not satisfied by %s; and not fully evaluated against %s",
+			strings.Join(failed, ", "), strings.Join(incomplete, ", "))}
+	case len(failed) > 0:
+		return &policyGateError{fmt.Sprintf(
+			"policy not satisfied by %s", strings.Join(failed, ", "))}
+	case len(incomplete) > 0:
+		return &policyGateError{fmt.Sprintf(
+			"policy could not be fully evaluated against %s, so compliance is not "+
+				"established. See the rules listed as not evaluated",
+			strings.Join(incomplete, ", "))}
+	}
+
+	return nil
 }
 
 var rootCmd = &cobra.Command{
@@ -66,6 +132,28 @@ It analyzes:
   • CNSA 2.0 compliance timeline
   • Security vulnerabilities and misconfigurations
 
+Quantum Ready grades, from the quantum readiness score:
+  Q+ 80-100   Q 50-79   Q- 20-49   QV below 20
+
+  The score weights the key exchange at 80 and the certificate at 20, so a
+  server offering hybrid key exchange with a classical certificate scores 64
+  and grades Q, not Q+. Q+ needs either a full post-quantum key exchange, which
+  is yours to deploy, or hybrid key exchange plus a post-quantum certificate,
+  which is not: no publicly trusted CA issues one yet. So a host running hybrid
+  key exchange is at the best posture most operators can reach today. The
+  QUANTUM RISK ASSESSMENT section of the report says that in full, and the
+  recommendations say to track CA readiness rather than asking for work that
+  cannot be done.
+
+TLS Security grades:
+  A+ 95-100   A 85-94   B 75-84   C 60-74   D 40-59   F below 40
+
+Exit codes:
+  0  scanned, and any policy applied was fully evaluated and satisfied
+  1  the scan could not be completed
+  2  a policy was applied and the target did not satisfy it, or the policy
+     could not be fully evaluated, which does not establish compliance
+
 Examples:
   tlsanalyzer example.com
   tlsanalyzer example.com:8443
@@ -76,6 +164,12 @@ Examples:
   tlsanalyzer --targets hosts.txt --format json`,
 	Args: cobra.MaximumNArgs(1),
 	RunE: runScan,
+
+	// A runtime failure is not a usage mistake. Every error, including an
+	// unreachable host, printed the error and then the whole ~30 line usage
+	// block after it, which buried the one line that mattered. Cobra still
+	// prints "Error: ..." itself; --help remains the way to see usage.
+	SilenceUsage: true,
 }
 
 var versionCmd = &cobra.Command{
@@ -111,9 +205,63 @@ var policiesCmd = &cobra.Command{
 	},
 }
 
+// printPolicyCmd emits a built-in policy in the exact shape --policy-file
+// accepts.
+//
+// The policy schema was documented nowhere, and unknown keys were silently
+// ignored, so a hand-written policy could be accepted, applied to nothing and
+// reported as compliant. Unknown keys are refused now, which makes having a
+// correct starting point part of the fix rather than a convenience.
+var printPolicyCmd = &cobra.Command{
+	Use:   "print-policy [name]",
+	Short: "Print a built-in policy as YAML, to copy as a starting point",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		evaluator := analyzer.NewPolicyEvaluator()
+		policy, ok := evaluator.GetPolicy(args[0])
+		if !ok {
+			names := evaluator.ListPolicies()
+			sort.Strings(names)
+			return fmt.Errorf("unknown policy: %s. Available: %s",
+				sanitize.ForReport(args[0], sanitize.MaxReportDetail), strings.Join(names, ", "))
+		}
+
+		out, err := yaml.Marshal(policy)
+		if err != nil {
+			return fmt.Errorf("failed to render policy as YAML: %w", err)
+		}
+
+		fmt.Printf("# Built-in policy %q, in the shape --policy-file accepts.\n", policy.Name)
+		fmt.Print(printPolicyHeader())
+		fmt.Print(string(out))
+		return nil
+	},
+}
+
+// printPolicyHeader describes the schema shown by print-policy.
+//
+// It is a function so a test can hold it to what the loader actually accepts.
+// It read "Every key below is part of the schema. Any other key is refused.",
+// which was false: `extends` is accepted and is not printed here, because a
+// built-in policy inherits from nothing. This is the only surface that shows a
+// user the schema, so the header left `extends` undiscoverable while the
+// policy-refusal messages tell the reader to reach for it.
+func printPolicyHeader() string {
+	return "# Every key below is part of the schema. The one key not shown here is\n" +
+		"# 'extends: <built-in policy name>', which inherits that policy's rules and\n" +
+		"# lets this file override individual ones. Any other key is refused.\n"
+}
+
 func init() {
 	rootCmd.AddCommand(versionCmd)
 	rootCmd.AddCommand(policiesCmd)
+	rootCmd.AddCommand(printPolicyCmd)
+
+	// Suppressing the usage block leaves a flag mistake with no next step, so
+	// point at --help explicitly rather than printing every flag.
+	rootCmd.SetFlagErrorFunc(func(cmd *cobra.Command, err error) error {
+		return fmt.Errorf("%w\nRun 'tlsanalyzer --help' to see the available flags", err)
+	})
 
 	// Output options
 	rootCmd.Flags().StringVarP(&outputFormat, "format", "f", "text",
@@ -161,21 +309,22 @@ func runScan(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	// Validate the flag values before anything else, so that an unusable value is
+	// reported as such whether or not a target was supplied. Checking targets
+	// first meant "tlsanalyzer --concurrency 0" answered "no targets specified"
+	// and said nothing about the concurrency.
+	if err := validateFlags(cmd); err != nil {
+		return err
+	}
+
 	if len(targets) == 0 {
 		return fmt.Errorf("no targets specified. Use 'tlsanalyzer example.com' or '--targets file.txt'")
 	}
 
-	// Reject an unrecognized format rather than falling back to text. A
-	// pipeline asking for "--format JSON" previously received a text report and
-	// a success exit code, so the mistake was invisible until something
-	// downstream failed to parse it.
-	if err := validateFormat(outputFormat); err != nil {
-		return err
-	}
-
 	// Apply --port only when the user actually passed it, so that targets
 	// written as host:port keep working and the default never silently
-	// rewrites them.
+	// rewrites them. A port written into the target itself is checked by the
+	// scanner when it parses the target, which is the one place both routes meet.
 	if cmd.Flags().Changed("port") {
 		for i, target := range targets {
 			targets[i] = applyPortOverride(target, port)
@@ -227,7 +376,8 @@ func runScan(cmd *cobra.Command, args []string) error {
 			var ok bool
 			policy, ok = evaluator.GetPolicy(policyName)
 			if !ok {
-				return fmt.Errorf("unknown policy: %s (use 'policies' command to list available policies)", policyName)
+				return fmt.Errorf("unknown policy: %s (use 'policies' command to list available policies)",
+					sanitize.ForReport(policyName, sanitize.MaxReportDetail))
 			}
 		}
 	}
@@ -240,17 +390,44 @@ func runScan(cmd *cobra.Command, args []string) error {
 	// Determine if batch mode
 	if len(targets) == 1 {
 		// Single target mode
-		return scanSingleTarget(ctx, s, cnsa2Analyzer, policyEvaluator, targets[0], policy, output)
+		return scanSingleTarget(ctx, s.Scan, cnsa2Analyzer, policyEvaluator, targets[0], policy, output)
 	}
 
 	// Batch mode
-	return scanBatchTargets(ctx, s, cnsa2Analyzer, policyEvaluator, targets, policy, output)
+	return scanBatchTargets(ctx, s.Scan, cnsa2Analyzer, policyEvaluator, targets, policy, output)
 }
 
-func scanSingleTarget(ctx context.Context, s *scanner.Scanner, cnsa2 *analyzer.CNSA2Analyzer, policyEval *analyzer.PolicyEvaluator, target string, policy *types.Policy, output *os.File) error {
-	result, err := s.Scan(ctx, target)
+// scanFunc performs one scan.
+//
+// The batch and single paths take the scan as a function rather than a
+// *scanner.Scanner so that output ordering can be tested against a completion
+// order that is deliberately the reverse of the input order. Nothing else can
+// prove the ordering fix, because a real scan finishes in whatever order the
+// network allows.
+type scanFunc func(ctx context.Context, target string) (*types.ScanResult, error)
+
+// scrubbedError renders an error's message with control characters collapsed,
+// while still unwrapping to the original.
+//
+// Errors reaching stderr carry the target back to the user, and the target may
+// come from a --targets file somebody else wrote, so stderr is a forgery surface
+// too: it shares the terminal with the report and a sweep prints it after every
+// report it produced. The message cannot simply be rebuilt with %s, because
+// main unwraps with errors.As to tell a policy-gate failure (exit 2) from a scan
+// failure (exit 1), and flattening the chain would silently change the exit code
+// this tool's own CI guidance depends on. So scrub the text and keep the chain.
+type scrubbedError struct{ err error }
+
+func (e scrubbedError) Error() string {
+	return sanitize.ForReport(e.err.Error(), sanitize.MaxReportDetail)
+}
+
+func (e scrubbedError) Unwrap() error { return e.err }
+
+func scanSingleTarget(ctx context.Context, scan scanFunc, cnsa2 *analyzer.CNSA2Analyzer, policyEval *analyzer.PolicyEvaluator, target string, policy *types.Policy, output io.Writer) error {
+	result, err := scan(ctx, target)
 	if err != nil {
-		return fmt.Errorf("scan failed: %w", err)
+		return fmt.Errorf("scan failed: %w", scrubbedError{err})
 	}
 
 	// Add CNSA 2.0 analysis
@@ -267,14 +444,23 @@ func scanSingleTarget(ctx context.Context, s *scanner.Scanner, cnsa2 *analyzer.C
 	// provenance rather than the scanner package default.
 	result.ScannerVersion = version
 
-	// Create reporter and output
+	// Create reporter and output. The report is written before any gate result
+	// is returned, so a failing policy still prints the findings that explain it.
 	rep := createReporter()
-	return rep.Report(output, result)
+	if err := rep.Report(output, result); err != nil {
+		return err
+	}
+
+	return policyOutcome([]*types.ScanResult{result})
 }
 
-func scanBatchTargets(ctx context.Context, s *scanner.Scanner, cnsa2 *analyzer.CNSA2Analyzer, policyEval *analyzer.PolicyEvaluator, targets []string, policy *types.Policy, output *os.File) error {
-	results := make([]*types.ScanResult, 0, len(targets))
-	var mu sync.Mutex
+func scanBatchTargets(ctx context.Context, scan scanFunc, cnsa2 *analyzer.CNSA2Analyzer, policyEval *analyzer.PolicyEvaluator, targets []string, policy *types.Policy, output io.Writer) error {
+	// Results are written to a fixed slot per target, so batch output follows the
+	// order of the targets file. Appending as each scan finished produced an order
+	// that varied between identical runs, and did so even at --concurrency 1,
+	// because the semaphore does not hand out slots in the order goroutines
+	// queued for them. That made a --targets sweep undiffable in CI.
+	results := make([]*types.ScanResult, len(targets))
 	var wg sync.WaitGroup
 
 	// Semaphore for concurrency control
@@ -285,15 +471,15 @@ func scanBatchTargets(ctx context.Context, s *scanner.Scanner, cnsa2 *analyzer.C
 	completed := 0
 	var progressMu sync.Mutex
 
-	for _, target := range targets {
+	for i, target := range targets {
 		wg.Add(1)
-		go func(t string) {
+		go func(slot int, t string) {
 			defer wg.Done()
 
 			sem <- struct{}{}        // Acquire
 			defer func() { <-sem }() // Release
 
-			result, err := s.Scan(ctx, t)
+			result, err := scan(ctx, t)
 			if err != nil {
 				result = &types.ScanResult{
 					Target:         t,
@@ -319,9 +505,7 @@ func scanBatchTargets(ctx context.Context, s *scanner.Scanner, cnsa2 *analyzer.C
 				result.ScannerVersion = version
 			}
 
-			mu.Lock()
-			results = append(results, result)
-			mu.Unlock()
+			results[slot] = result
 
 			// Update progress
 			progressMu.Lock()
@@ -330,7 +514,7 @@ func scanBatchTargets(ctx context.Context, s *scanner.Scanner, cnsa2 *analyzer.C
 				fmt.Fprintf(os.Stderr, "\rScanning: %d/%d targets completed", completed, total)
 			}
 			progressMu.Unlock()
-		}(target)
+		}(i, target)
 	}
 
 	wg.Wait()
@@ -351,7 +535,10 @@ func scanBatchTargets(ctx context.Context, s *scanner.Scanner, cnsa2 *analyzer.C
 		if !jsonCompact {
 			encoder.SetIndent("", "  ")
 		}
-		return encoder.Encode(results)
+		if err := encoder.Encode(results); err != nil {
+			return err
+		}
+		return batchOutcome(results)
 	}
 
 	rep := createReporter()
@@ -364,7 +551,41 @@ func scanBatchTargets(ctx context.Context, s *scanner.Scanner, cnsa2 *analyzer.C
 		}
 	}
 
-	return nil
+	return batchOutcome(results)
+}
+
+// batchOutcome fails the run when any target could not be scanned.
+//
+// Batch mode exited 0 with nothing on stderr even when every target failed, so
+// "tlsanalyzer --targets hosts.txt && deploy" proceeded on a sweep that measured
+// nothing. The single-target path has always exited non-zero for the same
+// failure; this makes the two agree.
+func batchOutcome(results []*types.ScanResult) error {
+	failed := make([]string, 0, len(results))
+	for _, result := range results {
+		if result != nil && result.Error != "" {
+			failed = append(failed, result.Target)
+		}
+	}
+
+	// These names came from the targets file, so they are untrusted text on their
+	// way to a terminal. stderr is not the report, but it shares the terminal with
+	// it, and a sweep prints this line after every report it produced.
+	for i := range failed {
+		failed[i] = sanitize.ForReport(failed[i], sanitize.MaxReportDetail)
+	}
+
+	switch len(failed) {
+	case 0:
+		// Nothing failed to scan, so any remaining failure is the policy gate's.
+		return policyOutcome(results)
+	case len(results):
+		return fmt.Errorf("no targets could be scanned (%d of %d failed): %s",
+			len(failed), len(results), strings.Join(failed, ", "))
+	default:
+		return fmt.Errorf("%d of %d targets could not be scanned: %s",
+			len(failed), len(results), strings.Join(failed, ", "))
+	}
 }
 
 // applyPortOverride attaches the --port value to a target.
@@ -414,6 +635,56 @@ func collectTargets(args []string) ([]string, error) {
 	return targets, nil
 }
 
+// validateFlags rejects every flag value the tool cannot act on, before any
+// target is resolved or any connection is attempted.
+//
+// --port was the only numeric flag that was checked. --concurrency 0 hung
+// forever on an unbuffered semaphore with nothing on either stream,
+// --concurrency -1 panicked out of make() with a Go stack trace that also printed
+// absolute source paths, and --timeout 0 or a negative value meant no timeout at
+// all, so a single unresponsive host wedged an entire sweep.
+func validateFlags(cmd *cobra.Command) error {
+	// Reject an unrecognized format rather than falling back to text. A pipeline
+	// asking for "--format JSON" previously received a text report and a success
+	// exit code, so the mistake was invisible until something downstream failed
+	// to parse it.
+	if err := validateFormat(outputFormat); err != nil {
+		return err
+	}
+
+	if cmd.Flags().Changed("port") {
+		if err := scanner.ValidatePort(port); err != nil {
+			return fmt.Errorf("--port: %w", err)
+		}
+	}
+
+	if concurrency < 1 {
+		return fmt.Errorf("--concurrency: invalid value %d: must be at least 1", concurrency)
+	}
+
+	if timeout < 1 {
+		return fmt.Errorf("--timeout: invalid value %d: must be at least 1 second", timeout)
+	}
+
+	// Both flags name a policy and only one can be applied. --policy-file won
+	// silently, so a run could be evaluated against a different policy than the
+	// one the command line most visibly asked for, with nothing in the output
+	// saying which had been used.
+	if policyName != "" && policyFile != "" {
+		// Both values come from the invocation, which this tool treats as
+		// untrusted text, and policyName is already scrubbed where it is printed
+		// as an unknown policy. Printing the same variable raw here was the split
+		// that makes "fixing one print site is not fixing the class" concrete.
+		return fmt.Errorf(
+			"--policy %s and --policy-file %s both name a policy, and only one can be applied. "+
+				"Pass one of them",
+			sanitize.ForReport(policyName, sanitize.MaxReportDetail),
+			sanitize.ForReport(policyFile, sanitize.MaxReportDetail))
+	}
+
+	return nil
+}
+
 // supportedFormats lists the accepted --format values, in help-text order.
 var supportedFormats = []string{"text", "json", "sarif", "cbom", "html"}
 
@@ -440,9 +711,31 @@ func createReporter() reporter.Reporter {
 	case reporter.FormatHTML:
 		return &reporter.HTMLReporter{IncludeCSS: true}
 	default:
-		return &reporter.TextReporter{NoColor: noColor || !isTTY()}
+		return &reporter.TextReporter{NoColor: !useColorForTextReport(noColor, outputFile, stdoutIsTTY())}
 	}
 }
+
+// useColorForTextReport decides whether the text report may carry ANSI escapes.
+//
+// Colour is decided by the DESTINATION, not by stdout. Before 0.4.0 this read
+// only stdout's TTY-ness, so `tlsanalyzer host -o report.txt` run from a
+// terminal wrote 363 escape bytes into the saved file: the report went to the
+// file while the colour decision still consulted the terminal. A saved report is
+// read later by a pager, an editor, a diff or an auditor, so it has to be plain.
+func useColorForTextReport(noColorFlag bool, outputPath string, stdoutIsTerminal bool) bool {
+	if noColorFlag {
+		return false
+	}
+	if outputPath != "" {
+		return false
+	}
+	return stdoutIsTerminal
+}
+
+// stdoutIsTTY is a variable so tests can drive the decision in both directions.
+// Under `go test` stdout is never a terminal, so a test that read the real one
+// would pass before the fix and prove nothing.
+var stdoutIsTTY = isTTY
 
 // isTTY checks if stdout is a terminal
 func isTTY() bool {

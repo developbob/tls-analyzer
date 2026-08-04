@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 
 	"github.com/csnp/qramm-tls-analyzer/pkg/types"
@@ -118,11 +119,6 @@ func (r *CBOMReporter) protocolComponent(p types.Protocol, target string) types.
 func (r *CBOMReporter) cipherComponent(cs types.CipherSuite, target string) types.CryptoComponent {
 	ref := fmt.Sprintf("cipher-%s-%s", target, cs.Name)
 
-	primitive := "ae" // Authenticated encryption
-	if cs.MAC != "" {
-		primitive = "cipher"
-	}
-
 	quantumLevel := 0
 	if cs.QuantumSafe {
 		quantumLevel = 1 // NIST Level 1 minimum for PQC
@@ -136,8 +132,8 @@ func (r *CBOMReporter) cipherComponent(cs types.CipherSuite, target string) type
 		CryptoProperties: types.CryptoProperties{
 			AssetType: "algorithm",
 			AlgorithmProperties: &types.AlgorithmProps{
-				Primitive:              primitive,
-				Mode:                   r.extractMode(cs.Encryption),
+				Primitive:              cipherPrimitive(cs),
+				Mode:                   cipherMode(cs),
 				ClassicalSecurityLevel: cs.Bits,
 				QuantumSecurityLevel:   quantumLevel,
 				CryptoFunctions:        []string{"encrypt", "decrypt"},
@@ -262,21 +258,61 @@ func (r *CBOMReporter) certificateComponent(cert *types.Certificate, target stri
 			Occurrences: []types.CryptoOccurrence{
 				{
 					Location:          "TLS certificate",
-					AdditionalContext: fmt.Sprintf("Expires in %d days", cert.DaysUntilExpiry),
+					AdditionalContext: certificateValidityContext(cert),
 				},
 			},
 		},
 	}
 }
 
-func (r *CBOMReporter) extractMode(encryption string) string {
-	switch encryption {
-	case "AES-GCM":
+// cipherPrimitive classifies a cipher suite for CycloneDX.
+//
+// `primitive` is a closed enum and "cipher" is not a member of it, so every
+// document containing a suite with a separate MAC failed schema validation
+// outright. That is the same defect 0.3.0 fixed for key exchange, where "kex"
+// was emitted, and left in place here.
+//
+// A suite with no separate MAC is an AEAD construction. A suite that carries one
+// is a cipher composed with a MAC, and is classified by the cipher.
+func cipherPrimitive(cs types.CipherSuite) string {
+	if cs.MAC == "" {
+		return "ae"
+	}
+
+	switch {
+	case strings.Contains(cs.Encryption, "ChaCha20"), strings.Contains(cs.Encryption, "RC4"):
+		return "stream-cipher"
+	case strings.Contains(cs.Encryption, "AES"), strings.Contains(cs.Encryption, "DES"):
+		return "block-cipher"
+	default:
+		// Better an honest "other" than a value outside the enum, which would
+		// invalidate the entire document rather than one field.
+		return "other"
+	}
+}
+
+// cipherMode returns the block cipher mode of operation.
+//
+// `mode` is a closed enum of block modes, so the previous "stream" for
+// ChaCha20-Poly1305 was not a member. A stream cipher has no block mode, and the
+// field is omitempty, so it is left out rather than filled with a value outside
+// the enum.
+//
+// The mode is taken from the suite name, which carries it, rather than from the
+// Encryption summary. The summary is "AES" for every CBC suite, so reading it
+// reported no mode at all for the suites that have the most interesting one.
+func cipherMode(cs types.CipherSuite) string {
+	name := strings.ToUpper(cs.Name)
+
+	switch {
+	case strings.Contains(name, "_GCM"):
 		return "gcm"
-	case "AES-CBC":
+	case strings.Contains(name, "_CCM"):
+		return "ccm"
+	case strings.Contains(name, "_CBC"):
 		return "cbc"
-	case "ChaCha20-Poly1305":
-		return "stream"
+	case strings.Contains(strings.ToUpper(cs.Encryption), "GCM"):
+		return "gcm"
 	default:
 		return ""
 	}
@@ -290,5 +326,34 @@ func (r *CBOMReporter) keyExchangeDescription(ke types.KeyExchange) string {
 		return fmt.Sprintf("Post-quantum key encapsulation: %s", ke.PQCAlgorithm)
 	default:
 		return fmt.Sprintf("Classical key exchange: %s", ke.Name)
+	}
+}
+
+// certificateValidityContext describes the certificate's validity window for a
+// CBOM consumer.
+//
+// It said "Expires in N days" whatever the window was, so a certificate dated to
+// start next year read as a healthy long-lived one: the only human-readable
+// string in the component described it by a date it never reaches in a usable
+// state. The structured notValidBefore is present either way, but the prose has
+// to agree with it.
+//
+// A certificate can set both flags if its notAfter precedes its notBefore, and
+// that window is never open at all, so it is named rather than described by
+// whichever branch happens to be tested first. Expiry is tested before the start
+// of the window, matching the text report and the grade, so one scan cannot
+// describe one certificate two ways.
+func certificateValidityContext(cert *types.Certificate) string {
+	switch {
+	case cert.Expired && cert.NotYetValid:
+		return fmt.Sprintf("Never valid; the validity period ends %s, before it starts %s",
+			cert.NotAfter.Format("2006-01-02"), cert.NotBefore.Format("2006-01-02"))
+	case cert.Expired:
+		return fmt.Sprintf("Expired on %s", cert.NotAfter.Format("2006-01-02"))
+	case cert.NotYetValid:
+		return fmt.Sprintf("Not yet valid; validity period starts %s",
+			cert.NotBefore.Format("2006-01-02"))
+	default:
+		return fmt.Sprintf("Expires in %d days", cert.DaysUntilExpiry)
 	}
 }

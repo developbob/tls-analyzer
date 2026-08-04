@@ -1,5 +1,7 @@
 package types
 
+import "reflect"
+
 // Policy defines organizational TLS security requirements.
 type Policy struct {
 	// Metadata
@@ -30,6 +32,18 @@ type PolicyRules struct {
 
 	// Quantum/PQC requirements
 	Quantum QuantumRules `json:"quantum" yaml:"quantum"`
+}
+
+// IsEmpty reports whether no rule at all is set, which makes the policy one
+// that nothing can fail. A compliant verdict from such a policy carries no
+// information, so a policy file that produces one is refused at load.
+//
+// The comparison is against the zero value rather than a list of fields, so a
+// rule field added later is covered without anyone remembering to come back
+// here. Hand-maintained field lists are what let the extends merge silently
+// drop most of a policy file.
+func (r PolicyRules) IsEmpty() bool {
+	return reflect.DeepEqual(r, PolicyRules{})
 }
 
 // ProtocolRules defines TLS protocol requirements.
@@ -124,11 +138,41 @@ type PolicyViolation struct {
 	Remediation string   `json:"remediation"`
 }
 
+// SkippedPolicyRule records a rule that was not evaluated because the input it
+// reads was not measured in this scan.
+//
+// A rule whose input was not measured is neither passed nor failed, and it must
+// not be treated as either. Reading an unmeasured quantum score as the number 0
+// produced "[HIGH] Quantum readiness score below minimum, Expected: >= 90 |
+// Actual: 0" in the same report that said "Quantum Ready: not assessed".
+type SkippedPolicyRule struct {
+	Rule   string `json:"rule"`
+	Reason string `json:"reason"`
+}
+
 // PolicyResult contains the results of policy evaluation.
 type PolicyResult struct {
-	PolicyName string            `json:"policyName"`
-	Compliant  bool              `json:"compliant"`
-	Score      int               `json:"score"`
+	PolicyName string `json:"policyName"`
+	Compliant  bool   `json:"compliant"`
+	Score      int    `json:"score"`
+
+	// Complete is false when at least one rule was skipped, which makes both
+	// Compliant and Score answers about a smaller set of rules than the policy
+	// defines. Score is computed by deducting from 100, so a skipped rule can
+	// only raise it, and declining a check must never read as an improvement.
+	//
+	// The zero value is the cautious one: a PolicyResult that nothing filled in
+	// does not claim to be a complete evaluation.
+	Complete bool `json:"complete"`
+
+	// SkippedRules names what was not evaluated and why.
+	SkippedRules []SkippedPolicyRule `json:"skippedRules,omitempty"`
+
+	// Scope states what this verdict covers. A policy evaluation of a CNSA 2.0
+	// target year and the CNSA 2.0 timeline section can disagree about the same
+	// deadline because they ask different questions, and neither said so.
+	Scope string `json:"scope"`
+
 	Violations []PolicyViolation `json:"violations"`
 	Warnings   []PolicyViolation `json:"warnings"`
 }
@@ -142,7 +186,7 @@ var DefaultPolicies = map[string]Policy{
 		Rules: PolicyRules{
 			Protocol: ProtocolRules{
 				MinVersion:     "TLS 1.2",
-				BannedVersions: []string{"SSL 3.0", "TLS 1.0", "TLS 1.1"},
+				BannedVersions: []string{"TLS 1.0", "TLS 1.1"},
 			},
 			Cipher: CipherRules{
 				MinKeySize:            128,
@@ -170,7 +214,7 @@ var DefaultPolicies = map[string]Policy{
 			Protocol: ProtocolRules{
 				MinVersion:       "TLS 1.3",
 				RequiredVersions: []string{"TLS 1.3"},
-				BannedVersions:   []string{"SSL 3.0", "TLS 1.0", "TLS 1.1", "TLS 1.2"},
+				BannedVersions:   []string{"TLS 1.0", "TLS 1.1", "TLS 1.2"},
 			},
 			Cipher: CipherRules{
 				MinKeySize:            256,
@@ -225,7 +269,7 @@ var DefaultPolicies = map[string]Policy{
 			Protocol: ProtocolRules{
 				MinVersion:       "TLS 1.3",
 				RequiredVersions: []string{"TLS 1.3"},
-				BannedVersions:   []string{"SSL 3.0", "TLS 1.0", "TLS 1.1", "TLS 1.2"},
+				BannedVersions:   []string{"TLS 1.0", "TLS 1.1", "TLS 1.2"},
 			},
 			Cipher: CipherRules{
 				MinKeySize:            256,

@@ -24,6 +24,14 @@ func (r *HTMLReporter) Report(w io.Writer, result *types.ScanResult) error {
 		"formatTime":    formatTime,
 		"progressBar":   progressBar,
 		"statusIcon":    statusIcon,
+		// The icon and the badge answer the same question, so they read the
+		// same predicate rather than each carrying its own copy of the version
+		// list.
+		"protocolIcon":         protocolIcon,
+		"isDeprecatedProtocol": types.IsDeprecatedProtocol,
+		// Shared with the text reporter so the two cannot describe the same
+		// deduction differently.
+		"describePenalties": describePenalties,
 	}).Parse(htmlTemplate)
 	if err != nil {
 		return fmt.Errorf("failed to parse template: %w", err)
@@ -75,8 +83,14 @@ func riskClass(level types.RiskLevel) string {
 		return "risk-high"
 	case types.RiskMedium:
 		return "risk-medium"
-	default:
+	case types.RiskLow:
 		return "risk-low"
+	default:
+		// A level this function does not recognise is not a low risk, it is an
+		// unknown one. Defaulting to the reassuring class styled an empty risk
+		// level green, which is how an assessment that never ran was painted as
+		// the best possible outcome.
+		return "risk-unknown"
 	}
 }
 
@@ -106,6 +120,22 @@ func statusIcon(supported bool) template.HTML {
 		return template.HTML(`<span class="status-icon status-good">✓</span>`)
 	}
 	return template.HTML(`<span class="status-icon status-bad">✗</span>`)
+}
+
+// protocolIcon distinguishes a protocol that is supported and current from one
+// that is supported and deprecated. Both used to render as the same green
+// check, so an HTML report showed TLS 1.0 and TLS 1.1 rows as good while the
+// text report called them deprecated and the vulnerability list flagged TLS 1.0
+// HIGH. The .status-warn class was already defined in the stylesheet and used
+// nowhere, so the warning styling was intended and lost.
+func protocolIcon(p types.Protocol) template.HTML {
+	if !p.Supported {
+		return template.HTML(`<span class="status-icon status-bad">✗</span>`)
+	}
+	if types.IsDeprecatedProtocol(p.Version) {
+		return template.HTML(`<span class="status-icon status-warn">⚠</span>`)
+	}
+	return template.HTML(`<span class="status-icon status-good">✓</span>`)
 }
 
 const htmlTemplate = `<!DOCTYPE html>
@@ -293,6 +323,7 @@ const htmlTemplate = `<!DOCTYPE html>
         .risk-high { background: #7b341e; color: #fbd38d; }
         .risk-medium { background: #744210; color: #faf089; }
         .risk-low { background: #22543d; color: #9ae6b4; }
+        .risk-unknown { background: #2d3748; color: #cbd5e0; }
 
         .vuln-item, .rec-item {
             padding: 1rem;
@@ -407,7 +438,11 @@ const htmlTemplate = `<!DOCTYPE html>
             <div class="grade-box quantum-grade">
                 <div class="grade-label">Quantum Readiness</div>
                 <div class="grade-letter">{{.Grade.QuantumGrade}}</div>
+                {{if .QuantumRisk.Assessed}}
                 <div class="grade-score">{{.QuantumRisk.Score}}/100</div>
+                {{else}}
+                <div class="grade-score">not assessed</div>
+                {{end}}
             </div>
         </div>
 
@@ -429,6 +464,29 @@ const htmlTemplate = `<!DOCTYPE html>
                         <td>{{.Details}}</td>
                     </tr>
                     {{end}}
+                    <tr>
+                        <td><strong>Dimension subtotal</strong></td>
+                        <td><strong>{{.Grade.DimensionScore}}/100</strong></td>
+                        <td>{{.Grade.DimensionPoints}} of {{.Grade.DimensionMaxPoints}} available points</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Vulnerability penalty</strong></td>
+                        {{if not .Grade.VulnerabilitiesAssessed}}
+                        <td><strong>not measured</strong></td>
+                        <td>Vulnerability checks were skipped, so the score below is an upper bound and is not comparable with a full scan.</td>
+                        {{else if .Grade.VulnerabilityPenalty}}
+                        <td><strong>-{{.Grade.VulnerabilityPenalty}}</strong></td>
+                        <td>{{describePenalties .Grade.Penalties}}</td>
+                        {{else}}
+                        <td><strong>none</strong></td>
+                        <td>No vulnerability findings deducted points.</td>
+                        {{end}}
+                    </tr>
+                    <tr>
+                        <td><strong>TLS Security score</strong></td>
+                        <td><strong>{{.Grade.Score}}/100</strong></td>
+                        <td>{{if .Grade.PenaltyFloored}}The penalty exceeded the subtotal, so the score is held at 0.{{end}}</td>
+                    </tr>
                 </tbody>
             </table>
         </section>
@@ -447,10 +505,10 @@ const htmlTemplate = `<!DOCTYPE html>
                     {{range .Protocols}}
                     <tr>
                         <td>{{.Version}}</td>
-                        <td>{{statusIcon .Supported}}</td>
+                        <td>{{protocolIcon .}}</td>
                         <td>
                             {{if .Preferred}}<span class="badge" style="background:#2d3748">Preferred</span>{{end}}
-                            {{if and .Supported (or (eq .Version "TLS 1.0") (eq .Version "TLS 1.1"))}}
+                            {{if and .Supported (isDeprecatedProtocol .Version)}}
                             <span class="badge severity-medium">Deprecated</span>
                             {{end}}
                         </td>
@@ -460,6 +518,7 @@ const htmlTemplate = `<!DOCTYPE html>
             </table>
         </section>
 
+        {{if .QuantumRisk.Assessed}}
         <section>
             <h2 class="quantum">Quantum Risk Assessment</h2>
             <div class="quantum-details">
@@ -497,6 +556,15 @@ const htmlTemplate = `<!DOCTYPE html>
                 <div class="quantum-metric-value">{{.QuantumRisk.TimeToAction}}</div>
             </div>
         </section>
+        {{else}}
+        <section>
+            <h2 class="quantum">Quantum Risk Assessment</h2>
+            <p>This scan did not assess quantum readiness, so this report says nothing
+            about it. The section was previously drawn from a zero-valued assessment,
+            which showed an empty risk level styled as low risk and a score of 0 out of
+            100. Re-run without --skip-quantum to measure it.</p>
+        </section>
+        {{end}}
 
         {{if .Vulnerabilities}}
         <section>

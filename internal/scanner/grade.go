@@ -51,6 +51,7 @@ func (s *Scanner) calculateGrade(result *types.ScanResult) types.Grade {
 	// the grade a whole band and reported a quantum score of 0 for servers that
 	// verifiably negotiate a hybrid ML-KEM group. A check that was not run
 	// contributes neither points nor maximum.
+	var skippedDimensions []string
 	if s.config.CheckQuantum {
 		quantumScore := result.QuantumRisk.Score / 4 // Scale 0-100 to 0-25
 		factors = append(factors, types.GradeFactor{
@@ -61,29 +62,38 @@ func (s *Scanner) calculateGrade(result *types.ScanResult) types.Grade {
 		})
 		totalScore += quantumScore
 		maxTotal += 25
+	} else {
+		// Excluding the dimension keeps the score honest about what it measured,
+		// but it also renormalizes over the remaining dimensions, and quantum
+		// readiness is the one most servers score worst on. So skipping it RAISES
+		// the reported grade. Recording which dimension was dropped is what lets
+		// the report say the number is not comparable with a full scan's.
+		skippedDimensions = append(skippedDimensions, "Quantum Readiness")
 	}
 
-	// Calculate final percentage
-	finalScore := 0
+	// Normalize the dimensions to a percentage.
+	dimensionScore := 0
 	if maxTotal > 0 {
-		finalScore = (totalScore * 100) / maxTotal
+		dimensionScore = (totalScore * 100) / maxTotal
+	}
+	if dimensionScore > 100 {
+		dimensionScore = 100
+	}
+	if dimensionScore < 0 {
+		dimensionScore = 0
 	}
 
-	// Apply vulnerability penalties
-	for _, vuln := range result.Vulnerabilities {
-		switch vuln.Severity {
-		case types.SeverityCritical:
-			finalScore -= 30
-		case types.SeverityHigh:
-			finalScore -= 15
-		case types.SeverityMedium:
-			finalScore -= 5
-		}
-	}
+	// Apply vulnerability penalties, and record them. The deduction is real and
+	// consistently applied, but it was never reported, so a breakdown printing
+	// "Protocol 10 + Cipher 15 + Certificate 25 + Quantum 16" under a headline of
+	// 21/100 gave a reader no way to reconcile the two numbers.
+	penalties, penaltyTotal := vulnerabilityPenalties(result.Vulnerabilities)
 
-	// Clamp score
+	finalScore := dimensionScore - penaltyTotal
+	penaltyFloored := false
 	if finalScore < 0 {
 		finalScore = 0
+		penaltyFloored = true
 	}
 	if finalScore > 100 {
 		finalScore = 100
@@ -93,6 +103,21 @@ func (s *Scanner) calculateGrade(result *types.ScanResult) types.Grade {
 		Letter:  scoresToLetter(finalScore),
 		Score:   finalScore,
 		Factors: factors,
+
+		DimensionScore:     dimensionScore,
+		DimensionPoints:    totalScore,
+		DimensionMaxPoints: maxTotal,
+		SkippedDimensions:  skippedDimensions,
+
+		VulnerabilityPenalty: penaltyTotal,
+		Penalties:            penalties,
+		PenaltyFloored:       penaltyFloored,
+
+		// A skipped check leaves the penalty unmeasured, not zero. Recording
+		// which it was is what stops "--skip-vulns" reading as an improvement:
+		// on cloudflare.com it moved the reported grade from F (21/100) to
+		// C (66/100) purely by declining to look.
+		VulnerabilitiesAssessed: s.config.CheckVulns,
 	}
 
 	// Only assign a quantum letter when the assessment ran. Deriving one from a
@@ -101,10 +126,54 @@ func (s *Scanner) calculateGrade(result *types.ScanResult) types.Grade {
 	if s.config.CheckQuantum {
 		grade.QuantumGrade = quantumScoreToLetter(result.QuantumRisk.Score)
 	} else {
-		grade.QuantumGrade = "not assessed"
+		grade.QuantumGrade = types.QuantumGradeNotAssessed
 	}
 
 	return grade
+}
+
+// vulnerabilityPenaltyPoints is the deduction applied per finding at each
+// severity, in the order the breakdown prints them. LOW and INFO findings do not
+// move the score, which is why they are absent rather than listed as zero.
+var vulnerabilityPenaltyPoints = []struct {
+	Severity types.Severity
+	Points   int
+}{
+	{types.SeverityCritical, 30},
+	{types.SeverityHigh, 15},
+	{types.SeverityMedium, 5},
+}
+
+// vulnerabilityPenalties itemizes the score deduction by severity and returns
+// the total. Splitting it out is what lets the report show the penalty as its
+// own line instead of leaving it as the unexplained gap between the dimension
+// subtotal and the headline score.
+func vulnerabilityPenalties(vulns []types.Vulnerability) ([]types.GradePenalty, int) {
+	counts := make(map[types.Severity]int, len(vulnerabilityPenaltyPoints))
+	for _, v := range vulns {
+		counts[v.Severity]++
+	}
+
+	var (
+		itemized []types.GradePenalty
+		total    int
+	)
+	for _, p := range vulnerabilityPenaltyPoints {
+		count := counts[p.Severity]
+		if count == 0 {
+			continue
+		}
+		points := count * p.Points
+		itemized = append(itemized, types.GradePenalty{
+			Severity:    p.Severity,
+			Count:       count,
+			PointsEach:  p.Points,
+			PointsTotal: points,
+		})
+		total += points
+	}
+
+	return itemized, total
 }
 
 func scoreProtocols(protocols []types.Protocol) (int, int) {
@@ -131,12 +200,20 @@ func scoreProtocols(protocols []types.Protocol) (int, int) {
 		}
 	}
 
-	// Scoring logic
+	// TLS 1.3 carries the full credit for this dimension on its own.
+	//
+	// The previous model added 15 for TLS 1.3 and a further 10 for TLS 1.2, so a
+	// TLS 1.3-only server could not score above 15 of 25 and turning TLS 1.2 off
+	// cost ten points. That is the configuration this tool's own `strict` and
+	// `cnsa-2.0-2030` policies require, so following its advice lowered its grade,
+	// and the best achievable protocol posture was structurally denied the top of
+	// the dimension. TLS 1.2 alongside TLS 1.3 is neither a bonus nor a penalty:
+	// it is still a secure protocol, and its presence is what the policy layer is
+	// for. Only deprecated versions move the score down.
 	if tls13 {
-		score += 15 // TLS 1.3 support is key
-	}
-	if tls12 {
-		score += 10 // TLS 1.2 is still good
+		score += 25
+	} else if tls12 {
+		score += 10 // Secure, but not modern.
 	}
 	if tls11 {
 		score -= 5 // Penalty for TLS 1.1
@@ -234,9 +311,22 @@ func scoreCertificate(cert *types.Certificate) (int, int) {
 
 	score := 15 // Base score for having a valid cert
 
-	// Validity
-	if cert.Expired {
-		return 0, maxScore // Expired = 0
+	// Validity. Both ends of the window score zero: a certificate whose validity
+	// has not started is refused by every client exactly as an expired one is,
+	// and it previously scored 25 of 25 because the chain check steps aside for
+	// it and nothing else looked at notBefore.
+	if cert.Expired || cert.NotYetValid {
+		return 0, maxScore
+	}
+
+	// A certificate that is not valid for the name it was asked for, or that
+	// does not chain to a trusted root, cannot authenticate the connection at
+	// all: every client refuses it outright, exactly as it refuses an expired
+	// one. So the dimension scores zero for the same reason expiry does.
+	// wrong.host.badssl.com and untrusted-root.badssl.com both scored 25 of 25
+	// before this, which told an operator the certificate was perfect.
+	if cert.NameMatch == types.CheckFailed || cert.ChainTrust == types.CheckFailed {
+		return 0, maxScore
 	}
 
 	if cert.DaysUntilExpiry > 30 {
@@ -372,13 +462,29 @@ func describeCertScore(cert *types.Certificate) string {
 	if cert.Expired {
 		return "Critical: Certificate has expired"
 	}
+	if cert.NotYetValid {
+		return "Critical: Certificate is not yet valid"
+	}
+	if cert.NameMatch == types.CheckFailed {
+		return "Critical: Certificate is not valid for " + cert.RequestedName
+	}
+	if cert.ChainTrust == types.CheckFailed {
+		return "Critical: Certificate does not chain to a trusted root"
+	}
 	if cert.DaysUntilExpiry < 30 {
 		return "Warning: Certificate expiring soon"
 	}
 	if cert.IsSelfSigned {
 		return "Note: Self-signed certificate"
 	}
-	return "Valid certificate from trusted CA"
+
+	// Say what was checked rather than asserting more than that. This line read
+	// "Valid certificate from trusted CA" while nothing verified the chain at
+	// all, so untrusted-root.badssl.com carried it too.
+	if cert.NameMatch == types.CheckPassed && cert.ChainTrust == types.CheckPassed {
+		return "Certificate is current, valid for " + cert.RequestedName + ", and chains to a trusted root"
+	}
+	return "Certificate is current; name or chain verification did not run"
 }
 
 func describeQuantumScore(qr types.QuantumRiskAssessment) string {
