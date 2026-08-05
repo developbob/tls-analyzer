@@ -6,8 +6,16 @@ import (
 	"github.com/csnp/qramm-tls-analyzer/pkg/types"
 )
 
-// This file names nothing that did not already exist, so it compiles against the
-// pre-fix sources and fails there on behaviour.
+// HOW THIS FILE IS RED-PROVED, corrected in 0.4.1.
+//
+// It used to claim it could be built against the sources before the fix and
+// would fail there on behaviour. That was measured in 0.4.1 rather than
+// believed, and it is false: copied alone into a pristine tree at a869357 this
+// file does not build. 0.4.0 landed as a single squashed commit, so the helpers,
+// the new types and the production change all arrived together and no test in
+// that release has an earlier tree to be built against. Several files carried
+// the same claim; docs/testing/red-proof.md has the measured table and the
+// command that reproduces it. Red proofs name their mutation instead.
 //
 // The defect: the expiring-soon finding was guarded on DaysUntilExpiry > 0,
 // standing in for "the certificate has not expired". DaysUntilExpiry is computed

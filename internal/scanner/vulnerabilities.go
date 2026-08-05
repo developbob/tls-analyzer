@@ -172,11 +172,49 @@ func (s *Scanner) checkVulnerabilities(result *types.ScanResult) []types.Vulnera
 			})
 		}
 
-		// Chain does not build to a trusted root. Reported only when the
-		// certificate is not self-signed, because the self-signed finding below
-		// is the more specific diagnosis of the same condition and stating it
-		// twice would deduct twice for one decision.
-		if cert.ChainTrust == types.CheckFailed && !cert.IsSelfSigned {
+		// A chain that does not build to a trusted root produces exactly one
+		// finding, and the same one whatever shape the certificate has.
+		//
+		// These used to be two independent conditions whose exclusions composed:
+		// the untrusted-chain finding stepped aside for a self-signed certificate
+		// on the grounds that the self-signed finding was the more specific
+		// diagnosis, and the self-signed finding stepped aside for a CA. A
+		// self-signed CA leaf satisfies both, so neither fired, and `openssl req
+		// -x509` emits CA:TRUE by default, which makes that the common shape
+		// rather than an exotic one. Measured on the production path against a
+		// local listener: self-signed CA:TRUE scored C 66 with no findings,
+		// self-signed CA:FALSE scored C 61 with one, and an untrusted CA-issued
+		// certificate scored D 51. The server chose its own row and the worst
+		// posture scored best.
+		//
+		// The severity no longer depends on IsSelfSigned, which matters because
+		// IsSelfSigned is a subject-equals-issuer STRING comparison and the server
+		// picks both names. It selects the wording of the diagnosis and nothing
+		// else, so a certificate cannot lower its own penalty by choosing how it
+		// describes itself. What decides the finding is the verification result,
+		// which is the one thing in this decision the server does not control.
+		//
+		// A client that verifies refuses all three of these the same way, so they
+		// carry the same severity. The self-signed case is not a milder condition
+		// than an untrusted chain; it is the same condition with a shorter chain.
+		switch {
+		case cert.ChainTrust == types.CheckFailed && cert.IsSelfSigned:
+			vulns = append(vulns, types.Vulnerability{
+				ID:       "CERT_SELF_SIGNED",
+				Name:     "Self-Signed Certificate",
+				Severity: types.SeverityHigh,
+				Description: fmt.Sprintf(
+					"The certificate signed itself, so the chain does not build to a root in "+
+						"this host's trust store (%s). Browsers and API clients refuse it by "+
+						"default, exactly as they refuse a chain from an untrusted CA.",
+					cert.ChainTrustReason),
+				Remediation: "Use a certificate from a Certificate Authority the intended " +
+					"clients trust. If this host is deliberately served by an internal CA, " +
+					"issue the certificate from that CA rather than self-signing it, and " +
+					"install the CA in the trust store of every machine that has to reach it.",
+			})
+
+		case cert.ChainTrust == types.CheckFailed:
 			vulns = append(vulns, types.Vulnerability{
 				ID:       "CERT_CHAIN_UNTRUSTED",
 				Name:     "Certificate Chain Not Trusted",
@@ -190,16 +228,65 @@ func (s *Scanner) checkVulnerabilities(result *types.ScanResult) []types.Vulnera
 					"by an internal CA, that CA has to be installed in the trust store of the " +
 					"machine running the scan for this check to pass.",
 			})
-		}
 
-		// Self-signed certificate
-		if cert.IsSelfSigned && !cert.IsCA {
+		case cert.ChainTrust == types.CheckPassed && cert.IsSelfSigned:
+			// The chain verified and the certificate still signed itself, which
+			// means this machine's trust store carries it. That is a real
+			// configuration and not a failure here, but it does not travel: a
+			// client anywhere else refuses the same certificate. Reported at a
+			// lower severity because nothing was measured to be broken from where
+			// the scan ran.
 			vulns = append(vulns, types.Vulnerability{
-				ID:          "CERT_SELF_SIGNED",
-				Name:        "Self-Signed Certificate",
-				Severity:    types.SeverityMedium,
-				Description: "Self-signed certificates are not trusted by browsers and clients by default.",
-				Remediation: "Use a certificate from a trusted Certificate Authority.",
+				ID:       "CERT_SELF_SIGNED",
+				Name:     "Self-Signed Certificate",
+				Severity: types.SeverityMedium,
+				Description: "The certificate signed itself and verified only because this " +
+					"machine's trust store already carries it. Any client that does not have " +
+					"it installed refuses the connection.",
+				Remediation: "Use a certificate from a Certificate Authority the intended " +
+					"clients trust, rather than relying on the certificate being installed " +
+					"on each machine.",
+			})
+
+		case cert.IsSelfSigned:
+			// The chain check did not run, which this scanner does when the
+			// certificate is outside its own validity window. So this finding must
+			// not describe a verification result: there isn't one.
+			//
+			// The first version of this switch had no case for CheckNotPerformed
+			// and fell into the one above, which told the reader the certificate
+			// "verified only because this machine's trust store already carries
+			// it" about a certificate that was never verified and is in nobody's
+			// trust store. A false measurement claim, in a release whose subject
+			// is refusing to describe what was not measured.
+			//
+			// The SECOND version said "see the line above for why", which is a
+			// claim about the report's own layout, and it was false on four of the
+			// five renderers: SARIF and HTML carry no chain-trust line at all, and
+			// in the text report the line above is another finding's remediation.
+			// A finding must carry its own reason, the way the failed-chain arm
+			// does, so the reason is interpolated here and no positional reference
+			// is made. Two rounds of review on one paragraph is the argument for
+			// saying less, not more.
+			//
+			// Reachable and not exotic: an expired self-signed certificate on the
+			// pure-Go verifier, which is what every Linux host runs.
+			reason := cert.ChainTrustReason
+			if reason == "" {
+				reason = "the chain check did not run"
+			}
+			vulns = append(vulns, types.Vulnerability{
+				ID:       "CERT_SELF_SIGNED",
+				Name:     "Self-Signed Certificate",
+				Severity: types.SeverityMedium,
+				Description: fmt.Sprintf(
+					"The certificate signed itself. Whether its chain builds to a trusted "+
+						"root was not established (%s), so this scan says nothing either way "+
+						"about it. A self-signed certificate is refused by default by any "+
+						"client that does not already have it installed.", reason),
+				Remediation: "Resolve the condition that stopped the chain from being " +
+					"checked, then use a certificate from a Certificate Authority the " +
+					"intended clients trust.",
 			})
 		}
 

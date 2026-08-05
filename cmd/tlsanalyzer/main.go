@@ -4,7 +4,6 @@ package main
 import (
 	"bufio"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -28,7 +27,7 @@ import (
 )
 
 var (
-	version = "0.4.0"
+	version = "0.4.1"
 	commit  = "dev"
 	date    = "unknown"
 )
@@ -91,12 +90,21 @@ func policyOutcome(results []*types.ScanResult) error {
 		if result == nil || result.PolicyResult == nil {
 			continue
 		}
+		// The target is untrusted text on its way to a terminal, exactly as it is
+		// in batchOutcome below, which scrubs the same field with the same
+		// reasoning. This function did not, and one variable printed raw at one of
+		// two sites is this release's own defect shape. No exploit was
+		// demonstrated, because a hostname carrying control bytes does not
+		// resolve, so a target that reaches a policy verdict has already been
+		// resolved; the asymmetry is closed on the argument that a print site's
+		// safety should not rest on a property of the resolver.
+		target := sanitize.ForReport(result.Target, sanitize.MaxReportDetail)
 		if !result.PolicyResult.Compliant {
-			failed = append(failed, result.Target)
+			failed = append(failed, target)
 		} else if !result.PolicyResult.Complete {
 			// A compliant verdict that skipped rules has not established
 			// compliance with the policy, only with the part of it that ran.
-			incomplete = append(incomplete, result.Target)
+			incomplete = append(incomplete, target)
 		}
 	}
 
@@ -121,7 +129,32 @@ func policyOutcome(results []*types.ScanResult) error {
 var rootCmd = &cobra.Command{
 	Use:   "tlsanalyzer [target]",
 	Short: "QRAMM TLS Analyzer - Quantum-ready TLS security assessment",
-	Long: `QRAMM TLS Analyzer performs comprehensive TLS security analysis
+	Long:  longDescription(),
+	Args:  cobra.MaximumNArgs(1),
+	RunE:  runScan,
+
+	// A runtime failure is not a usage mistake. Every error, including an
+	// unreachable host, printed the error and then the whole ~30 line usage
+	// block after it, which buried the one line that mattered. Cobra still
+	// prints "Error: ..." itself; --help remains the way to see usage.
+	SilenceUsage: true,
+}
+
+// longDescription builds the --help body, with every number in it RENDERED from
+// the code that produces it rather than restated beside it.
+//
+// The help used to carry its own copy of what each grade requires and said "Q+
+// ready: hybrid or full PQC key exchange in place", which the grader does not
+// do: hybrid key exchange with a classical certificate scores 64 and grades Q,
+// and Q+ was never observed on a hybrid host. The tests written for that pinned
+// the grader from both sides and read no help text at all, so they guarded the
+// one direction that had not gone wrong, and they passed unchanged against the
+// tree before the fix. A restatement can be false; a rendering cannot.
+func longDescription() string {
+	hybridWithClassicalCert := scanner.QuantumScoreFor(
+		scanner.QuantumHybridKeyExchangeScore, scanner.QuantumClassicalCertificateScore)
+
+	return fmt.Sprintf(`QRAMM TLS Analyzer performs comprehensive TLS security analysis
 with a focus on post-quantum cryptography readiness.
 
 It analyzes:
@@ -133,11 +166,11 @@ It analyzes:
   • Security vulnerabilities and misconfigurations
 
 Quantum Ready grades, from the quantum readiness score:
-  Q+ 80-100   Q 50-79   Q- 20-49   QV below 20
+  %s
 
-  The score weights the key exchange at 80 and the certificate at 20, so a
-  server offering hybrid key exchange with a classical certificate scores 64
-  and grades Q, not Q+. Q+ needs either a full post-quantum key exchange, which
+  The score weights the key exchange at %d and the certificate at %d, so a
+  server offering hybrid key exchange with a classical certificate scores %d
+  and grades %s, not %s. %s needs either a full post-quantum key exchange, which
   is yours to deploy, or hybrid key exchange plus a post-quantum certificate,
   which is not: no publicly trusted CA issues one yet. So a host running hybrid
   key exchange is at the best posture most operators can reach today. The
@@ -146,9 +179,18 @@ Quantum Ready grades, from the quantum readiness score:
   cannot be done.
 
 TLS Security grades:
-  A+ 95-100   A 85-94   B 75-84   C 60-74   D 40-59   F below 40
+  %s
 
-Exit codes:
+Exit codes:`,
+		scanner.DescribeBands(scanner.QuantumGradeBands()),
+		scanner.QuantumKeyExchangeWeight,
+		scanner.QuantumCertificateWeight,
+		hybridWithClassicalCert,
+		scanner.QuantumGradeFor(hybridWithClassicalCert),
+		scanner.QuantumGradeBands()[0].Letter,
+		scanner.QuantumGradeBands()[0].Letter,
+		scanner.DescribeBands(scanner.TLSGradeBands()),
+	) + `
   0  scanned, and any policy applied was fully evaluated and satisfied
   1  the scan could not be completed
   2  a policy was applied and the target did not satisfy it, or the policy
@@ -161,15 +203,7 @@ Examples:
   tlsanalyzer example.com --format html -o report.html
   tlsanalyzer example.com --format cbom -o inventory.json
   tlsanalyzer example.com --policy cnsa-2.0-2027
-  tlsanalyzer --targets hosts.txt --format json`,
-	Args: cobra.MaximumNArgs(1),
-	RunE: runScan,
-
-	// A runtime failure is not a usage mistake. Every error, including an
-	// unreachable host, printed the error and then the whole ~30 line usage
-	// block after it, which buried the one line that mattered. Cobra still
-	// prints "Error: ..." itself; --help remains the way to see usage.
-	SilenceUsage: true,
+  tlsanalyzer --targets hosts.txt --format json`
 }
 
 var versionCmd = &cobra.Command{
@@ -259,8 +293,15 @@ func init() {
 
 	// Suppressing the usage block leaves a flag mistake with no next step, so
 	// point at --help explicitly rather than printing every flag.
+	//
+	// pflag quotes the offending argument back ("unknown flag: --x", `invalid
+	// argument "y" for "-t, --timeout"`), and the invocation is one of the three
+	// enumerated sources of untrusted text, so this message is the same forgery
+	// surface as the report. The wrapper keeps the error chain intact so cobra
+	// still classifies it as a usage error.
 	rootCmd.SetFlagErrorFunc(func(cmd *cobra.Command, err error) error {
-		return fmt.Errorf("%w\nRun 'tlsanalyzer --help' to see the available flags", err)
+		return fmt.Errorf("%w\nRun 'tlsanalyzer --help' to see the available flags",
+			sanitize.WrapError(err))
 	})
 
 	// Output options
@@ -357,7 +398,9 @@ func runScan(cmd *cobra.Command, args []string) error {
 	if outputFile != "" {
 		f, err := os.Create(outputFile)
 		if err != nil {
-			return fmt.Errorf("failed to create output file: %w", err)
+			// The os error quotes the path back, and the path came from the
+			// invocation, which this tool treats as untrusted text.
+			return fmt.Errorf("failed to create output file: %w", sanitize.WrapError(err))
 		}
 		defer f.Close()
 		output = f
@@ -406,28 +449,10 @@ func runScan(cmd *cobra.Command, args []string) error {
 // network allows.
 type scanFunc func(ctx context.Context, target string) (*types.ScanResult, error)
 
-// scrubbedError renders an error's message with control characters collapsed,
-// while still unwrapping to the original.
-//
-// Errors reaching stderr carry the target back to the user, and the target may
-// come from a --targets file somebody else wrote, so stderr is a forgery surface
-// too: it shares the terminal with the report and a sweep prints it after every
-// report it produced. The message cannot simply be rebuilt with %s, because
-// main unwraps with errors.As to tell a policy-gate failure (exit 2) from a scan
-// failure (exit 1), and flattening the chain would silently change the exit code
-// this tool's own CI guidance depends on. So scrub the text and keep the chain.
-type scrubbedError struct{ err error }
-
-func (e scrubbedError) Error() string {
-	return sanitize.ForReport(e.err.Error(), sanitize.MaxReportDetail)
-}
-
-func (e scrubbedError) Unwrap() error { return e.err }
-
 func scanSingleTarget(ctx context.Context, scan scanFunc, cnsa2 *analyzer.CNSA2Analyzer, policyEval *analyzer.PolicyEvaluator, target string, policy *types.Policy, output io.Writer) error {
 	result, err := scan(ctx, target)
 	if err != nil {
-		return fmt.Errorf("scan failed: %w", scrubbedError{err})
+		return fmt.Errorf("scan failed: %w", sanitize.WrapError(err))
 	}
 
 	// Add CNSA 2.0 analysis
@@ -531,11 +556,15 @@ func scanBatchTargets(ctx context.Context, scan scanFunc, cnsa2 *analyzer.CNSA2A
 	// reject it, which broke the documented
 	// "tlsanalyzer --targets hosts.txt --format json" workflow.
 	if outputFormat == "json" {
-		encoder := json.NewEncoder(output)
-		if !jsonCompact {
-			encoder.SetIndent("", "  ")
+		// Through the same writer the single-target path uses, so the control
+		// characters encoding/json leaves raw are escaped here too. A batch sweep
+		// is the shape most likely to be saved and opened later, and this was the
+		// fourth JSON encoder in the tool with its own opinion.
+		indent := "  "
+		if jsonCompact {
+			indent = ""
 		}
-		if err := encoder.Encode(results); err != nil {
+		if err := reporter.WriteJSON(output, results, indent); err != nil {
 			return err
 		}
 		return batchOutcome(results)
@@ -616,7 +645,8 @@ func collectTargets(args []string) ([]string, error) {
 	if targetsFile != "" {
 		file, err := os.Open(targetsFile)
 		if err != nil {
-			return nil, fmt.Errorf("failed to open targets file: %w", err)
+			// Same reasoning as the output file: the os error carries the path.
+			return nil, fmt.Errorf("failed to open targets file: %w", sanitize.WrapError(err))
 		}
 		defer file.Close()
 
@@ -628,7 +658,8 @@ func collectTargets(args []string) ([]string, error) {
 			}
 		}
 		if err := scanner.Err(); err != nil {
-			return nil, fmt.Errorf("failed to read targets file: %w", err)
+			// bufio quotes the path in its read errors as well.
+			return nil, fmt.Errorf("failed to read targets file: %w", sanitize.WrapError(err))
 		}
 	}
 
@@ -696,8 +727,10 @@ func validateFormat(format string) error {
 			return nil
 		}
 	}
+	// The rejected value came from the invocation and is echoed back, so it is
+	// scrubbed for the same reason --policy and --policy-file are.
 	return fmt.Errorf("unknown format: %s (supported: %s)",
-		format, strings.Join(supportedFormats, ", "))
+		sanitize.ForReport(format, sanitize.MaxReportDetail), strings.Join(supportedFormats, ", "))
 }
 
 func createReporter() reporter.Reporter {

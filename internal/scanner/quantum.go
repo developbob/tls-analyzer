@@ -4,6 +4,52 @@ import (
 	"github.com/csnp/qramm-tls-analyzer/pkg/types"
 )
 
+// The quantum readiness score weights the two dimensions it measures. See
+// assessQuantumRisk for why they are not equal.
+//
+// These are exported, with the arithmetic, so the --help text can COMPUTE the
+// example it quotes. It used to carry a typed 64 beside a typed description of
+// the weighting, which is two restatements of one calculation, either of which
+// could go stale without anything noticing.
+const (
+	// QuantumKeyExchangeWeight is the key exchange's share of the score.
+	QuantumKeyExchangeWeight = 80
+	// QuantumCertificateWeight is the certificate's share.
+	QuantumCertificateWeight = 20
+
+	// QuantumHybridKeyExchangeScore is what a hybrid key exchange scores on its
+	// own dimension, and QuantumClassicalCertificateScore what a classical
+	// certificate scores on its.
+	//
+	// assessQuantumRisk READS these, rather than restating the same literals
+	// beside them. It did restate them at first, which made --help's worked
+	// example a restatement one level removed: raising the hybrid score to 95 in
+	// the grader left the help still saying 64, and the test that checked the
+	// help recomputed the same expression the help did, so it agreed with itself.
+	QuantumHybridKeyExchangeScore    = 80
+	QuantumClassicalCertificateScore = 0
+)
+
+// QuantumScoreFor combines the two dimension scores into the reported score.
+func QuantumScoreFor(keyExchangeScore, certificateScore int) int {
+	return (keyExchangeScore*QuantumKeyExchangeWeight +
+		certificateScore*QuantumCertificateWeight) / 100
+}
+
+// AssessQuantumRisk runs the quantum readiness assessment over an already
+// collected result, without a network.
+//
+// It exists so a caller outside this package can ask the GRADER what a given
+// posture scores, instead of recomputing the arithmetic and comparing that to
+// itself. The --help text quotes one such number, and the test that checks the
+// help originally recomputed `QuantumScoreFor(hybrid, classical)` — the same
+// expression the help is built from — so it agreed with itself and stayed green
+// while the grader returned something else entirely.
+func AssessQuantumRisk(result *types.ScanResult) types.QuantumRiskAssessment {
+	s := &Scanner{config: &Config{CheckQuantum: true}}
+	return s.assessQuantumRisk(result)
+}
+
 // QuantumVulnerableAlgorithms lists algorithms vulnerable to quantum attacks.
 var QuantumVulnerableAlgorithms = map[string]string{
 	"RSA":   "Vulnerable to Shor's algorithm",
@@ -63,7 +109,7 @@ func (s *Scanner) assessQuantumRisk(result *types.ScanResult) types.QuantumRiskA
 			assessment.Details = append(assessment.Details,
 				"Key exchange uses full post-quantum cryptography: "+ke.PQCAlgorithm)
 		case "hybrid":
-			keyExchangeScore = max(keyExchangeScore, 80)
+			keyExchangeScore = max(keyExchangeScore, QuantumHybridKeyExchangeScore)
 			hybridPQC = true
 			assessment.Details = append(assessment.Details,
 				"Key exchange uses hybrid PQC: "+ke.Name+" ("+ke.HybridClassical+" + "+ke.PQCAlgorithm+")")
@@ -98,11 +144,11 @@ func (s *Scanner) assessQuantumRisk(result *types.ScanResult) types.QuantumRiskA
 
 		switch cert.PublicKeyAlgorithm {
 		case "RSA":
-			certScore = 0
+			certScore = QuantumClassicalCertificateScore
 			assessment.Details = append(assessment.Details,
 				"Certificate uses RSA, vulnerable to Shor's algorithm")
 		case "ECDSA", "Ed25519":
-			certScore = 0
+			certScore = QuantumClassicalCertificateScore
 			assessment.Details = append(assessment.Details,
 				"Certificate uses elliptic curve cryptography, vulnerable to Shor's algorithm")
 		case "ML-DSA", "CRYSTALS-Dilithium":
@@ -141,7 +187,10 @@ func (s *Scanner) assessQuantumRisk(result *types.ScanResult) types.QuantumRiskA
 	//   well-configured site at a failing score and recommend work that cannot
 	//   be done, which is why the earlier 60/40 split produced a HIGH risk
 	//   verdict for servers already running hybrid PQC.
-	assessment.Score = (keyExchangeScore*80 + certScore*20) / 100
+	//
+	// The weights and the arithmetic are exported so --help can compute the
+	// example it quotes rather than restate a number somebody typed.
+	assessment.Score = QuantumScoreFor(keyExchangeScore, certScore)
 	assessment.HybridPQCReady = hybridPQC
 	assessment.FullPQCReady = fullPQC
 
