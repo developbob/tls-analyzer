@@ -1,5 +1,7 @@
 # Build stage
-FROM golang:1.25-alpine AS builder
+ARG BUILDER_IMAGE=golang:1.25-alpine
+ARG RUNTIME_IMAGE=alpine:3.19
+FROM ${BUILDER_IMAGE} AS builder
 
 ARG VERSION=dev
 ARG COMMIT=none
@@ -20,7 +22,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
     -o /usr/local/bin/tlsanalyzer ./cmd/tlsanalyzer
 
 # Runtime stage
-FROM alpine:3.19
+FROM ${RUNTIME_IMAGE}
 
 RUN apk --no-cache add ca-certificates
 
